@@ -1,5 +1,10 @@
 # 串口调试助手
 
+[![GitHub release](https://img.shields.io/github/v/release/seanoliverr/universal_serial_response_tool)](https://github.com/seanoliverr/universal_serial_response_tool/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows-blue)]()
+[![Python](https://img.shields.io/badge/python-3.x-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-green)]()
+
 一个功能强大的 Windows 桌面版串口调试工具，用于串口通信测试、设备调试、自动应答测试等场景。
 
 ## 功能特性

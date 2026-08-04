@@ -27,3 +27,6 @@ logs/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 发布物料（仅本地备用，不会入库）
+release/
