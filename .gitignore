@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 编译/打包产物
+build/
+dist/
+dist_nuitka/
+*.exe
+*.onefile-build/
+
+# Nuitka 缓存（编译器 + ccache，几百 MB，绝不应入库）
+nuitka_cache/
+nuitka-crash-report.xml
+
+# 运行日志
+log/
+logs/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
