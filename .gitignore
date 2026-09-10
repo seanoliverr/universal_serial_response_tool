@@ -30,3 +30,10 @@ Thumbs.db
 
 # 发布物料（仅本地备用，不会入库）
 release/
+
+# 本地数据模拟/诊断脚本及其输出（仅排查用，不入库）
+sim_*.py
+sim_*.txt
+diag*.txt
+p2.txt
+s6*.txt

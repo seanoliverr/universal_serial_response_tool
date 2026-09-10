@@ -367,6 +367,9 @@ class UartAssistantWindow(QMainWindow):
         self.receive_packet_count = 0
         self.send_count = 0
         self.send_packet_count = 0
+        # 自动应答「缓冲区超时（100ms 静默期内未匹配任何规则）」次数统计。
+        # 每次超时意味着一帧疑似失配数据被丢弃，仅用于排查，不参与任何收发逻辑、不持久化。
+        self.auto_reply_timeout_count = 0
         self.hex_mode = False
         self.show_timestamp = True
         self.batch_sending = False
@@ -375,6 +378,10 @@ class UartAssistantWindow(QMainWindow):
         self.batch_total = 0
         self.auto_reply_enabled = False
         self.reply_rules = []
+        # 自动应答规则命中次数计数器：{规则标识: 已命中次数}
+        # 作为应答帧「递增值」单元的 iteration（首次命中为 0，即取起始值），仅运行时有效不持久化。
+        # 由 _precompile_rules() 在规则集合变动时裁剪失效 key，避免长期运行内存增长。
+        self._reply_increment_counters = {}
         self.quick_commands = []
         self.send_history = []
         self.start_time = None
@@ -1622,7 +1629,9 @@ class UartAssistantWindow(QMainWindow):
                     'format': matched_rule.get('format', 'HEX'),
                     'responses': responses_snapshot,
                 }
-                self.send_reply(rule_snapshot, dict(matched_captures) if matched_captures else {})
+                # 命中次数按原规则对象统计，供应答帧「递增值」单元计算当前值
+                iteration = self._take_reply_iteration(matched_rule)
+                self.send_reply(rule_snapshot, dict(matched_captures) if matched_captures else {}, iteration)
                 # 匹配成功后清空缓冲区，避免重复匹配
                 self.auto_reply_buffer.clear()
                 self.auto_reply_buffer_timer.stop()
@@ -1748,10 +1757,33 @@ class UartAssistantWindow(QMainWindow):
         # 重置首字节时间戳，让下一帧重新计时
         self._buffer_first_byte_ms = 0
     
+    @staticmethod
+    def _format_hex_dump(data, max_bytes=512):
+        """把字节缓冲格式化成 hex 转储文本（每行最多16字节：偏移 + HEX + ASCII），仅用于排查日志。
+
+        超过 max_bytes 时只转储开头部分，避免异常长缓冲刷屏。
+        """
+        total = len(data)
+        show = data[:max_bytes]
+        lines = []
+        for off in range(0, len(show), 16):
+            chunk = show[off:off + 16]
+            hex_part = " ".join(f"{b:02X}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            lines.append(f"    {off:04X}  {hex_part:<47}  {ascii_part}")
+        text = "\n".join(lines)
+        if total > len(show):
+            text += f"\n    ... 共 {total} 字节，仅转储前 {len(show)} 字节"
+        return text
+
     def flush_auto_reply_buffer(self):
-        """刷新自动应答缓冲区，超时后清空缓冲区"""
+        """刷新自动应答缓冲区，超时后清空缓冲区（排查用：计数并 hex 转储被丢弃的数据）"""
         if len(self.auto_reply_buffer) > 0:
-            print(f"[DEBUG] 自动应答缓冲区超时，清空缓冲区，长度: {len(self.auto_reply_buffer)}")
+            self.auto_reply_timeout_count += 1
+            print(f"[DEBUG] 自动应答缓冲区超时，清空缓冲区，长度: {len(self.auto_reply_buffer)}，"
+                  f"累计失配次数: {self.auto_reply_timeout_count}")
+            print("[DEBUG] 失配缓冲转储(HEX/ASCII):\n"
+                  + self._format_hex_dump(bytes(self.auto_reply_buffer)))
             self.auto_reply_buffer.clear()
     
     def send_data(self, data=None, show_errors=True, _skip_stats=False):
@@ -1826,6 +1858,48 @@ class UartAssistantWindow(QMainWindow):
             byte_count = len(text.encode('utf-8'))
         self.send_stats_label.setText(f"{self._tr('长度：')}{byte_count}{self._tr(' 字节')}")
     
+    def _build_increment_bytes(self, unit, iteration=0):
+        """构造「递增值」单元的字节序列（批量发送与自动应答共用）。
+
+        unit 相关字段：
+        - value：起始值，十进制或 0x 前缀十六进制，解析失败按 0 处理；
+        - length：占用字节数；
+        - step：步进量，默认 1，允许负数实现递减；
+        - num_mode：'normal' 按二进制加，'bcd' 按十进制加并 BCD 编码；
+        - byte_order：'big' 高位在前（默认）/ 'little' 低位在前。
+
+        iteration 为当前轮次（从 0 开始），实际值 = 起始值 + iteration * step，
+        超出长度可表示范围后取模回绕（Python 取模结果恒为非负，故负步进同样安全）。
+        """
+        length = max(1, int(unit.get('length', 1) or 1))
+        raw_val = (unit.get('value', '') or '').strip()
+        try:
+            start_val = int(raw_val, 16) if raw_val.lower().startswith('0x') else (int(raw_val) if raw_val else 0)
+        except Exception:
+            start_val = 0
+        try:
+            step = int(unit.get('step', 1))
+        except Exception:
+            step = 1
+        order = 'big' if unit.get('byte_order', 'big') == 'big' else 'little'
+        it = max(0, int(iteration))
+
+        if unit.get('num_mode', 'normal') == 'bcd':
+            # BCD 十进制递增：十进制加步进后按 BCD 编码到 length 字节
+            max_dec = 10 ** (length * 2)  # length 字节 BCD 可表示 0 ~ 10^(2L)-1
+            current_dec = (start_val + it * step) % max_dec
+            digits = str(current_dec).rjust(length * 2, '0')
+            bcd_bytes = bytearray(
+                (int(digits[i]) << 4) | int(digits[i + 1])
+                for i in range(0, len(digits), 2))
+            if order != 'big':
+                bcd_bytes.reverse()
+            return bytes(bcd_bytes)
+
+        modulo = 1 << (length * 8)
+        current = (start_val + it * step) % modulo
+        return current.to_bytes(length, byteorder=order)
+
     def build_batch_frame_bytes(self, frame_units, fmt='HEX', iteration=0):
         """根据批量发送帧单元配置生成实际发送字节。
         复用自动应答匹配帧的单元类型：fixed / wildcard / checksum，
@@ -1848,39 +1922,7 @@ class UartAssistantWindow(QMainWindow):
             elif unit_type == 'wildcard':
                 data.extend(b'\x00' * length)
             elif unit_type == 'increment':
-                # 起始值支持 0x 前缀十六进制或十进制
-                raw_val = (unit.get('value', '') or '').strip()
-                try:
-                    start_val = int(raw_val, 16) if raw_val.lower().startswith('0x') else (int(raw_val) if raw_val else 0)
-                except Exception:
-                    start_val = 0
-                # 步进值：默认 1，允许用户设置（含负数）
-                try:
-                    step = int(unit.get('step', 1))
-                except Exception:
-                    step = 1
-                num_mode = unit.get('num_mode', 'normal')
-                order = unit.get('byte_order', 'big')
-                it = max(0, int(iteration))
-                if num_mode == 'bcd':
-                    # BCD 十进制递增：十进制 +1 后按 BCD 编码到 length 字节
-                    max_dec = 10 ** (length * 2)  # length 字节 BCD 可表示 0 ~ 10^(2L)-1
-                    # 起始值按十进制看待
-                    current_dec = (start_val + it * step) % max_dec
-                    # 编码为 BCD 字节序列（高位十进制在前）
-                    digits = str(current_dec).rjust(length * 2, '0')
-                    bcd_bytes = bytearray()
-                    for i in range(0, len(digits), 2):
-                        high = int(digits[i])
-                        low = int(digits[i + 1])
-                        bcd_bytes.append((high << 4) | low)
-                    if order != 'big':
-                        bcd_bytes.reverse()
-                    data.extend(bytes(bcd_bytes))
-                else:
-                    modulo = 1 << (length * 8)
-                    current = (start_val + it * step) % modulo
-                    data.extend(current.to_bytes(length, byteorder='big' if order == 'big' else 'little'))
+                data.extend(self._build_increment_bytes(unit, iteration))
             elif unit_type == 'checksum':
                 algo = unit.get('algorithm', 'xor8')
                 if algo == 'xor':
@@ -2710,11 +2752,13 @@ class UartAssistantWindow(QMainWindow):
         self.receive_packet_count = 0
         self.send_count = 0
         self.send_packet_count = 0
+        self.auto_reply_timeout_count = 0
         self.last_receive_count = 0
         if hasattr(self, 'temp_status_label'):
             self.temp_status_label.setText(
                 f"{self._tr('接收：')}{self.receive_count}{self._tr('字节')} | {self._tr('发送：')}{self.send_count}{self._tr('字节')} | "
                 f"{self.receive_packet_count}/{self.send_packet_count} | "
+                f"{self._tr('应答失配：')}0 | "
                 f"0.0 B/s"
             )
     
@@ -2965,6 +3009,10 @@ class UartAssistantWindow(QMainWindow):
                 preview += "??" * unit.get('length', 1) + " "
             elif unit_type == 'ref':
                 preview += f"<{unit.get('value', '')}> "
+            elif unit_type == 'increment':
+                # 递增值：展示起始值与步进，实际发送值随规则命中次数累加
+                start = (unit.get('value', '') or '0').strip()
+                preview += f"[{start}+{unit.get('step', 1)}] "
             elif unit_type == 'checksum':
                 algo = unit.get('algorithm', 'xor8')
                 label = dict((k, l) for l, k in UartAssistantWindow.CHECKSUM_LABELS).get(algo, algo)
@@ -3108,7 +3156,8 @@ class UartAssistantWindow(QMainWindow):
                             'responses': responses_snapshot,
                         }
                         # 应答延迟已在每条应答帧自带 delay_ms 内，这里直接触发
-                        self.send_reply(rule_snapshot, dict(captures) if captures else {})
+                        iteration = self._take_reply_iteration(rule)
+                        self.send_reply(rule_snapshot, dict(captures) if captures else {}, iteration)
                         break
                 except Exception as e:
                     print(f"[DEBUG] 处理规则异常: {rule.get('name', 'unknown')}, 错误: {e}")
@@ -3314,7 +3363,13 @@ class UartAssistantWindow(QMainWindow):
             traceback.print_exc()
             return False, {}
     
-    def send_reply(self, rule, captures=None):
+    def send_reply(self, rule, captures=None, iteration=0):
+        """按规则配置发送应答帧（支持多条应答 + 累计延迟）。
+
+        iteration 为该规则本次命中对应的轮次（从 0 开始），透传给
+        build_response_frame 供「递增值」单元计算当前值。同一次命中的多条应答
+        使用相同 iteration，保证同批应答内的递增字段取值一致。
+        """
         try:
             format_type = rule.get('format', 'HEX')
 
@@ -3334,7 +3389,7 @@ class UartAssistantWindow(QMainWindow):
                 if cumulative_delay <= 0:
                     # 立即发送：无需拷贝，直接使用原 frame / captures
                     try:
-                        data = self.build_response_frame(frame, format_type, captures or {})
+                        data = self.build_response_frame(frame, format_type, captures or {}, iteration)
                         if data:
                             success = self.send_data(data, show_errors=False, _skip_stats=True)
                             if not success:
@@ -3343,12 +3398,13 @@ class UartAssistantWindow(QMainWindow):
                         print(f"[ERROR] 应答#{idx + 1} 构造/发送异常: {e}")
                 else:
                     # 延时发送：拷贝所需数据，避免延时期间被修改
+                    # iteration 同样通过默认参数冻结，防止延时期间计数器变化导致取值错乱
                     import copy
                     frame_copy = copy.deepcopy(frame)
                     captures_copy = copy.deepcopy(captures) if captures else {}
-                    def _do_send(f=frame_copy, c=captures_copy, i=idx):
+                    def _do_send(f=frame_copy, c=captures_copy, i=idx, it=iteration):
                         try:
-                            data = self.build_response_frame(f, format_type, c)
+                            data = self.build_response_frame(f, format_type, c, it)
                             if data:
                                 success = self.send_data(data, show_errors=False, _skip_stats=True)
                                 if not success:
@@ -3390,7 +3446,28 @@ class UartAssistantWindow(QMainWindow):
                 self._rules_no_prefix.append(rule)
             else:
                 self._rules_first_byte_index.setdefault(first_byte, []).append(rule)
-    
+        # 裁剪递增计数器：只保留仍存在于 reply_rules 中的规则对象
+        # 规则被删除/编辑/导入替换后其计数自然清零（下次命中从起始值重新开始），
+        # 同时避免 id 被 Python 回收复用后错误继承旧计数（此处已先行删除）。
+        alive_ids = {id(r) for r in self.reply_rules}
+        if self._reply_increment_counters:
+            self._reply_increment_counters = {
+                k: v for k, v in self._reply_increment_counters.items() if k in alive_ids}
+
+    def _take_reply_iteration(self, rule):
+        """取出并累加指定规则的命中次数，供应答帧「递增值」单元使用。
+
+        返回值为本次命中对应的轮次（首次命中返回 0，即使用配置的起始值），
+        随后内部计数 +1。rule 需为 self.reply_rules 中的原始对象（非快照），
+        以 id() 作为 key；对象失效时由 _precompile_rules() 统一裁剪。
+        全部调用均发生在 Qt 主线程（串口数据经信号投递），故无需额外加锁。
+        """
+        key = id(rule)
+        current = self._reply_increment_counters.get(key, 0)
+        # 上限保护：避免长期运行时整数无限增长（1e9 轮后回绕，对任何字节长度均等价）
+        self._reply_increment_counters[key] = 0 if current >= 1000000000 else current + 1
+        return current
+
     def _filter_candidate_rules(self, buf_bytes):
         """从当前接收缓冲区中收集可能命中的候选规则列表（保持原顺序）。
         - 若缓冲区中出现过某字节 X，则 first_byte=X 的所有规则都作为候选。
@@ -3575,13 +3652,15 @@ class UartAssistantWindow(QMainWindow):
             return crc.to_bytes(nbytes, 'big')
         return b''
 
-    def build_response_frame(self, response_frame, fmt='HEX', captures=None):
+    def build_response_frame(self, response_frame, fmt='HEX', captures=None, iteration=0):
         """根据应答帧配置构造应答字节串。
         支持的单元类型：
         - fixed：固定值，按 length 组帧（值不足右侧补 0，超出按 length 截断）。
         - ref：引用匹配帧中通配符捕获到的值（通过 value 指定捕获单元名称）。
+        - increment：递增值，每次命中该规则后自动累加，按 length 字节表示。
         - checksum：对指定范围计算校验和（algorithm: xor/sum），追加 1 字节。
-        captures 为 match_frame 返回的捕获字典。"""
+        captures 为 match_frame 返回的捕获字典。
+        iteration 为该规则已命中次数（从 0 开始），供 increment 单元计算当前值。"""
         if captures is None:
             captures = {}
         data = bytearray()
@@ -3626,6 +3705,8 @@ class UartAssistantWindow(QMainWindow):
                 if not ref_bytes:
                     print(f"[DEBUG] 应答引用单元未找到捕获值: {ref_name}")
                 data.extend(ref_bytes)
+            elif unit_type == 'increment':
+                data.extend(self._build_increment_bytes(unit, iteration))
             elif unit_type == 'checksum':
                 algo = unit.get('algorithm', 'xor8')
                 # 兼容旧配置的算法名
@@ -3766,6 +3847,7 @@ class UartAssistantWindow(QMainWindow):
                     self.temp_status_label.setText(
                         f"{self._tr('接收：')}{self.receive_count}{self._tr('字节')} | {self._tr('发送：')}{self.send_count}{self._tr('字节')} | "
                         f"{self.receive_packet_count}/{self.send_packet_count} | "
+                        f"{self._tr('应答失配：')}{self.auto_reply_timeout_count} | "
                         f"{speed:.1f} B/s"
                     )
     
@@ -4140,6 +4222,7 @@ class RuleConfigDialog(QDialog):
         type_combo = QComboBox()
         type_combo.addItem(tr("固定值"), "fixed")
         type_combo.addItem(tr("引用匹配值"), "ref")
+        type_combo.addItem(tr("递增值"), "increment")
         type_combo.addItem(tr("校验"), "checksum")
         # 根据已有数据设置当前类型
         cur_type = unit_data.get('type', 'fixed')
@@ -4181,27 +4264,49 @@ class RuleConfigDialog(QDialog):
         end_spin.setToolTip("校验结束字节索引(含)，-1 表示到校验位前一字节")
         unit_layout.addWidget(end_spin)
         
-        # 校验字节序：高位在前(大端)/低位在前(小端)，仅多字节校验有意义
+        # 校验/递增值字节序：高位在前(大端)/低位在前(小端)，仅多字节时有意义
         order_combo = QComboBox()
         order_combo.addItem(tr("高位在前"), "big")
         order_combo.addItem(tr("低位在前"), "little")
         order_combo.setMaximumWidth(95)
-        order_combo.setToolTip("多字节校验值的字节顺序：高位在前(大端)或低位在前(小端)")
+        order_combo.setToolTip("多字节校验值/递增值的字节顺序：高位在前(大端)或低位在前(小端)")
         saved_order = unit_data.get('byte_order', 'big')
         order_index = order_combo.findData(saved_order)
         if order_index >= 0:
             order_combo.setCurrentIndex(order_index)
         unit_layout.addWidget(order_combo)
-        
+
+        # 步进值：仅递增值单元使用，默认 1，允许负数实现递减
+        step_spin = QSpinBox()
+        step_spin.setRange(-1000000, 1000000)
+        step_spin.setValue(int(unit_data.get('step', 1)))
+        step_spin.setPrefix(tr("步进") + ":")
+        step_spin.setMaximumWidth(110)
+        step_spin.setToolTip(tr("该规则每命中一次时递增值的步进量，默认1"))
+        unit_layout.addWidget(step_spin)
+
+        # 数值模式：仅递增值使用
+        num_mode_combo = QComboBox()
+        num_mode_combo.addItem(tr("普通数值"), "normal")
+        num_mode_combo.addItem(tr("BCD十进制"), "bcd")
+        num_mode_combo.setMaximumWidth(110)
+        num_mode_combo.setToolTip(tr("递增值的数值模式：普通数值按二进制加；BCD 按十进制加(HEX 显示跳过 A~F)"))
+        saved_num_mode = unit_data.get('num_mode', 'normal')
+        idx_nm = num_mode_combo.findData(saved_num_mode)
+        if idx_nm >= 0:
+            num_mode_combo.setCurrentIndex(idx_nm)
+        unit_layout.addWidget(num_mode_combo)
+
         value_edit = QLineEdit()
         value_edit.setText(unit_data.get('value', ''))
         unit_layout.addWidget(value_edit, 1)
-        
+
         del_btn = QPushButton(tr("删除"))
         del_btn.clicked.connect(lambda: target_layout.removeWidget(unit_widget) or unit_widget.deleteLater())
         unit_layout.addWidget(del_btn)
-        
+
         def update_controls():
+            """按当前单元类型切换各控件的可见性与可编辑状态，避免无关字段干扰。"""
             t = type_combo.currentData()
             if t == 'fixed':
                 value_edit.setEnabled(True)
@@ -4210,6 +4315,8 @@ class RuleConfigDialog(QDialog):
                 start_spin.setVisible(False)
                 end_spin.setVisible(False)
                 order_combo.setVisible(False)
+                step_spin.setVisible(False)
+                num_mode_combo.setVisible(False)
                 length_spin.setEnabled(True)
             elif t == 'ref':
                 value_edit.setEnabled(True)
@@ -4218,7 +4325,19 @@ class RuleConfigDialog(QDialog):
                 start_spin.setVisible(False)
                 end_spin.setVisible(False)
                 order_combo.setVisible(False)
+                step_spin.setVisible(False)
+                num_mode_combo.setVisible(False)
                 length_spin.setEnabled(False)
+            elif t == 'increment':
+                value_edit.setEnabled(True)
+                value_edit.setPlaceholderText(tr("起始值（十进制或0x前缀）"))
+                algo_combo.setVisible(False)
+                start_spin.setVisible(False)
+                end_spin.setVisible(False)
+                order_combo.setVisible(True)
+                step_spin.setVisible(True)
+                num_mode_combo.setVisible(True)
+                length_spin.setEnabled(True)
             elif t == 'checksum':
                 value_edit.setEnabled(False)
                 value_edit.setPlaceholderText(tr("校验自动计算"))
@@ -4226,23 +4345,29 @@ class RuleConfigDialog(QDialog):
                 start_spin.setVisible(True)
                 end_spin.setVisible(True)
                 order_combo.setVisible(True)
+                step_spin.setVisible(False)
+                num_mode_combo.setVisible(False)
                 length_spin.setEnabled(False)
-        
+
         type_combo.currentIndexChanged.connect(lambda _: update_controls())
         update_controls()
-        
+
         def get_unit_data():
             t = type_combo.currentData()
             data = {'name': name_edit.text(), 'length': length_spin.value(),
                     'type': t, 'value': value_edit.text()}
-            # 仅校验类型才保存算法和校验范围，避免 fixed/ref 单元导出冗余字段
+            # 仅按类型保存专属字段，避免 fixed/ref 单元导出冗余字段
             if t == 'checksum':
                 data['algorithm'] = algo_combo.currentData()
                 data['crc_start'] = start_spin.value()
                 data['crc_end'] = end_spin.value()
                 data['byte_order'] = order_combo.currentData()
+            elif t == 'increment':
+                data['byte_order'] = order_combo.currentData()
+                data['step'] = step_spin.value()
+                data['num_mode'] = num_mode_combo.currentData()
             return data
-        
+
         unit_widget.get_data = get_unit_data
         target_layout.insertWidget(target_layout.count() - 1, unit_widget)
     
@@ -4386,10 +4511,39 @@ class RuleConfigDialog(QDialog):
                     f"但值实际为 {actual} 字节（值：{value}）")
         return errors
 
+    def _validate_increment_units(self, frame, frame_label):
+        """校验帧中各 increment 单元的起始值：必须可解析、非负，且不超过 length 字节的可表示范围。
+
+        frame_label 用于错误提示中定位所属帧（如「发送帧单元配置」/「应答数据 #1」）。
+        返回错误信息列表（为空表示通过）。
+        """
+        errors = []
+        for idx, unit in enumerate(frame):
+            if unit.get('type') != 'increment':
+                continue
+            name = unit.get('name', '') or f'单元{idx + 1}'
+            length = unit.get('length', 1)
+            raw = (unit.get('value', '') or '').strip()
+            try:
+                start_val = int(raw, 16) if raw.lower().startswith('0x') else (int(raw) if raw else 0)
+            except Exception:
+                errors.append(f"{frame_label}「{name}」{tr('起始值格式无效')}：{raw}")
+                continue
+            if start_val < 0:
+                errors.append(f"{frame_label}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}）")
+                continue
+            if unit.get('num_mode', 'normal') == 'bcd':
+                max_bcd = 10 ** (length * 2)
+                if start_val >= max_bcd:
+                    errors.append(f"{frame_label}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}，BCD 最大值 {max_bcd - 1}）")
+            elif start_val >= (1 << (length * 8)):
+                errors.append(f"{frame_label}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}）")
+        return errors
+
     def accept(self):
         from PyQt5.QtWidgets import QWidget, QMessageBox
         fmt = self.format_combo.currentText()
-        
+
         match_frame = []
         for i in range(self.match_units_layout.count()):
             widget = self.match_units_layout.itemAt(i).widget()
@@ -4402,9 +4556,10 @@ class RuleConfigDialog(QDialog):
         # 纠错机制：校验固定值单元的字节长度是否与填写的值一致
         errors = self._validate_units(match_frame, fmt, tr("匹配条件"))
         for idx, resp in enumerate(responses):
-            errors += self._validate_units(
-                resp.get('frame', []), fmt,
-                f"{tr('应答数据')} #{idx + 1}")
+            resp_label = f"{tr('应答数据')} #{idx + 1}"
+            errors += self._validate_units(resp.get('frame', []), fmt, resp_label)
+            # 应答帧支持递增值单元，需额外校验其起始值范围
+            errors += self._validate_increment_units(resp.get('frame', []), resp_label)
         if errors:
             QMessageBox.warning(self, tr("单元字节长度错误"),
                                 tr("请修正以下单元后再保存：\n\n") + "\n".join(errors))
@@ -4492,28 +4647,7 @@ class BatchFrameConfigDialog(RuleConfigDialog):
 
         errors = self._validate_units(frame_units, fmt, tr("发送帧单元配置"))
         # 追加校验：递增值起始值必须可解析且不超过 length 字节可表示的最大值
-        for idx, unit in enumerate(frame_units):
-            if unit.get('type') != 'increment':
-                continue
-            name = unit.get('name', '') or f'单元{idx + 1}'
-            length = unit.get('length', 1)
-            raw = (unit.get('value', '') or '').strip()
-            try:
-                start_val = int(raw, 16) if raw.lower().startswith('0x') else (int(raw) if raw else 0)
-            except Exception:
-                errors.append(f"{tr('发送帧单元配置')}「{name}」{tr('起始值格式无效')}：{raw}")
-                continue
-            if start_val < 0:
-                errors.append(f"{tr('发送帧单元配置')}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}）")
-                continue
-            num_mode = unit.get('num_mode', 'normal')
-            if num_mode == 'bcd':
-                max_bcd = 10 ** (length * 2)
-                if start_val >= max_bcd:
-                    errors.append(f"{tr('发送帧单元配置')}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}，BCD 最大值 {max_bcd - 1}）")
-            else:
-                if start_val >= (1 << (length * 8)):
-                    errors.append(f"{tr('发送帧单元配置')}「{name}」{tr('起始值超出字节长度可表示的最大值')}（值：{raw}，长度：{length}）")
+        errors += self._validate_increment_units(frame_units, tr("发送帧单元配置"))
         if errors:
             QMessageBox.warning(self, tr("单元字节长度错误"),
                                 tr("请修正以下单元后再保存：\n\n") + "\n".join(errors))
@@ -4743,7 +4877,7 @@ class HelpDialog(QDialog):
 <li><b>固定值</b>：按数据格式（文本 / HEX）填写具体字节，长度必须匹配。</li>
 <li><b>通配符</b>：占位用；在发送场景下按长度填 <code>0x00</code>。</li>
 <li><b>校验</b>：算法有 <code>sum8 / sum8_reverse / lrc / sum16 / sum16_inet / xor8 / 多种 CRC</code>；可设置校验范围（起始/结束字节索引，-1 表示到校验位前一字节）与字节序（大端/小端）。</li>
-<li><b>递增值</b>（仅批量发送）：每完成一轮批量发送后自动累加。字段：
+<li><b>递增值</b>（批量发送每完成一轮后累加；自动应答按该规则每命中一次累加）。字段：
   <ul>
     <li><b>起始值</b>：填十进制数（例如 <code>0</code>、<code>10</code>）或 <code>0x</code> 前缀十六进制（例如 <code>0x0A</code>）。</li>
     <li><b>步进</b>：默认 1，允许负数用于递减。</li>
@@ -4768,7 +4902,8 @@ class HelpDialog(QDialog):
   <ul>
     <li>支持 <b>多条应答帧</b>，点击 <b>添加应答帧</b> 追加。</li>
     <li>每条应答独立配置 <b>应答延迟（ms）</b>：<b>累计间隔式</b> —— 第 N 条实际发送时刻 = 前 N 条延迟之和（从收到匹配帧开始计时）。</li>
-    <li>单元类型：固定值、<b>引用匹配值</b>（回显匹配帧中命名的通配符字段）、校验（自动计算）。</li>
+    <li>单元类型：固定值、<b>引用匹配值</b>（回显匹配帧中命名的通配符字段）、<b>递增值</b>（该规则每命中一次自动累加，可用于应答包序号/计数器；支持起始值、步进、字节序与普通数值 / BCD十进制模式）、校验（自动计算）。</li>
+    <li><b>递增值说明</b>：计数按规则独立维护，首次命中使用起始值；同一次命中的多条应答帧使用同一个值；规则被修改、删除或重新导入后计数会从起始值重新开始；程序重启不保留计数。</li>
   </ul>
 </li>
 <li>右键点击规则行可 <b>上移 / 下移</b> 调整匹配优先级；靠前的规则会优先命中。</li>
