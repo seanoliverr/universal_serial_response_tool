@@ -382,6 +382,11 @@ class UartAssistantWindow(QMainWindow):
         # 作为应答帧「递增值」单元的 iteration（首次命中为 0，即取起始值），仅运行时有效不持久化。
         # 由 _precompile_rules() 在规则集合变动时裁剪失效 key，避免长期运行内存增长。
         self._reply_increment_counters = {}
+        # 已启用规则的「帧头前缀」字节集合：每条规则首个 fixed 单元的完整字节串。
+        # 仅用于失配统计口径——缓冲超时丢弃时，含某规则帧头却未命中才算「真正失配」，
+        # 不含任何规则帧头的无关数据（如模组回应的 OK/ERROR）静默丢弃，不计失配。
+        # 由 _precompile_rules() 在规则变动后重建。
+        self._rules_match_prefixes = []
         self.quick_commands = []
         self.send_history = []
         self.start_time = None
@@ -1777,13 +1782,28 @@ class UartAssistantWindow(QMainWindow):
         return text
 
     def flush_auto_reply_buffer(self):
-        """刷新自动应答缓冲区，超时后清空缓冲区（排查用：计数并 hex 转储被丢弃的数据）"""
+        """刷新自动应答缓冲区，超时后清空缓冲区。
+
+        失配统计口径（仅统计「目标数据帧」是否失配）：
+        - 缓冲中含任一已启用规则的帧头前缀、却最终未命中 → 判定为真正失配，计数并 hex 转储；
+        - 不含任何规则帧头的无关数据（如模组对 AT 指令回应的 OK/ERROR）→ 静默清空，不计失配；
+        - 存在「首单元非固定值」的规则（无法预提取帧头）时，无法排除相关性，保守计为失配，避免漏报。
+        """
         if len(self.auto_reply_buffer) > 0:
-            self.auto_reply_timeout_count += 1
-            print(f"[DEBUG] 自动应答缓冲区超时，清空缓冲区，长度: {len(self.auto_reply_buffer)}，"
-                  f"累计失配次数: {self.auto_reply_timeout_count}")
-            print("[DEBUG] 失配缓冲转储(HEX/ASCII):\n"
-                  + self._format_hex_dump(bytes(self.auto_reply_buffer)))
+            buf_bytes = bytes(self.auto_reply_buffer)
+            if not hasattr(self, '_rules_match_prefixes'):
+                self._precompile_rules()
+            # 帧头未知的规则存在时无法判定，保守按失配处理
+            is_real_mismatch = bool(self._rules_no_prefix) or any(
+                p and p in buf_bytes for p in self._rules_match_prefixes)
+            if is_real_mismatch:
+                self.auto_reply_timeout_count += 1
+                print(f"[DEBUG] 自动应答缓冲区超时，清空缓冲区，长度: {len(buf_bytes)}，"
+                      f"累计失配次数: {self.auto_reply_timeout_count}")
+                print("[DEBUG] 失配缓冲转储(HEX/ASCII):\n"
+                      + self._format_hex_dump(buf_bytes))
+            else:
+                print(f"[DEBUG] 自动应答缓冲区超时，丢弃无关数据（不计失配），长度: {len(buf_bytes)}")
             self.auto_reply_buffer.clear()
     
     def send_data(self, data=None, show_errors=True, _skip_stats=False):
@@ -3457,6 +3477,7 @@ class UartAssistantWindow(QMainWindow):
         必须在 reply_rules 变动后调用。"""
         self._rules_first_byte_index = {}
         self._rules_no_prefix = []
+        self._rules_match_prefixes = []
         for rule in self.reply_rules:
             if not rule.get('enabled', True):
                 continue
@@ -3472,6 +3493,8 @@ class UartAssistantWindow(QMainWindow):
                     flen = first.get('length', 1)
                     if raw and flen > 0 and len(raw) >= 1:
                         first_byte = raw[0]
+                        # 完整帧头前缀用于失配判定（首字节过滤粒度过粗）
+                        self._rules_match_prefixes.append(bytes(raw))
                 except Exception:
                     first_byte = None
             if first_byte is None:
