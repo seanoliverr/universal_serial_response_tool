@@ -1822,9 +1822,16 @@ class UartAssistantWindow(QMainWindow):
                     data = processed_text.encode('utf-8')
             
             if isinstance(data, bytes) and len(data) > 0:
-                # 写串口 -> 更新统计（关键路径，最短完成）
-                self.serial_port.write(data)
-                self.send_count += len(data)
+                # 写串口 -> 校验实际写入字节数，再更新统计（关键路径，最短完成）
+                total = len(data)
+                written = self.serial_port.write(data)
+                # pyserial write 返回实际写入字节数；个别封装可能返回 None，则不据此判失败。
+                # 仅当返回明确整数且小于应发长度时，记录「不完整写入」——纯排查：不补发、不重试、不改字节。
+                if isinstance(written, int) and written < total:
+                    print(f"[ERROR] 串口写入不完整: 应发 {total} 字节，实际仅写入 {written} 字节"
+                          f"（未补发，本次发送判定失败）")
+                    return False
+                self.send_count += total
                 self.send_packet_count += 1
                 
                 # 显示发送 & 更新输入框长度统计：非关键路径 -> 异步投递，避免阻塞当前 slot
