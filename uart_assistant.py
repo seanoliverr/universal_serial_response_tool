@@ -1883,6 +1883,11 @@ class UartAssistantWindow(QMainWindow):
         右对齐补 '0'。HEX 等其他格式输出二进制 / BCD 原始字节。
         """
         length = max(1, int(unit.get('length', 1) or 1))
+        # 防御：increment 为数值宽度，超过 16 字节起始值无法表达且 to_bytes 会申请超大内存，
+        # 钳制到 MAX_INCREMENT_UNIT_LENGTH（正常配置经 UI/校验已限制，此处兜底外部编辑的规则文件）。
+        if length > MAX_INCREMENT_UNIT_LENGTH:
+            print(f"[WARN] 递增值单元长度 {length} 超过上限 {MAX_INCREMENT_UNIT_LENGTH}，已按上限处理")
+            length = MAX_INCREMENT_UNIT_LENGTH
         raw_val = (unit.get('value', '') or '').strip()
         try:
             start_val = int(raw_val, 16) if raw_val.lower().startswith('0x') else (int(raw_val) if raw_val else 0)
@@ -4106,9 +4111,9 @@ class RuleConfigDialog(QDialog):
         unit_layout.addWidget(name_edit)
         
         length_spin = QSpinBox()
-        length_spin.setRange(1, 255)
+        length_spin.setRange(1, MAX_FRAME_UNIT_LENGTH)
         length_spin.setValue(unit_data.get('length', 1))
-        length_spin.setMaximumWidth(60)
+        length_spin.setMaximumWidth(70)
         unit_layout.addWidget(length_spin)
         
         type_combo = QComboBox()
@@ -4241,9 +4246,9 @@ class RuleConfigDialog(QDialog):
         unit_layout.addWidget(name_edit)
         
         length_spin = QSpinBox()
-        length_spin.setRange(1, 255)
+        length_spin.setRange(1, MAX_FRAME_UNIT_LENGTH)
         length_spin.setValue(unit_data.get('length', 1))
-        length_spin.setMaximumWidth(60)
+        length_spin.setMaximumWidth(70)
         unit_layout.addWidget(length_spin)
         
         type_combo = QComboBox()
@@ -4345,6 +4350,7 @@ class RuleConfigDialog(QDialog):
                 step_spin.setVisible(False)
                 num_mode_combo.setVisible(False)
                 length_spin.setEnabled(True)
+                length_spin.setMaximum(MAX_FRAME_UNIT_LENGTH)
             elif t == 'ref':
                 value_edit.setEnabled(True)
                 value_edit.setPlaceholderText(tr("引用的匹配单元名称"))
@@ -4365,6 +4371,7 @@ class RuleConfigDialog(QDialog):
                 step_spin.setVisible(True)
                 num_mode_combo.setVisible(True)
                 length_spin.setEnabled(True)
+                length_spin.setMaximum(MAX_INCREMENT_UNIT_LENGTH)
             elif t == 'checksum':
                 value_edit.setEnabled(False)
                 value_edit.setPlaceholderText(tr("校验自动计算"))
@@ -4550,6 +4557,11 @@ class RuleConfigDialog(QDialog):
                 continue
             name = unit.get('name', '') or f'单元{idx + 1}'
             length = unit.get('length', 1)
+            if length > MAX_INCREMENT_UNIT_LENGTH:
+                errors.append(
+                    f"{frame_label}「{name}」递增值单元长度 {length} 超过上限 "
+                    f"{MAX_INCREMENT_UNIT_LENGTH} 字节（数值宽度无实际意义），请改小")
+                continue
             raw = (unit.get('value', '') or '').strip()
             try:
                 start_val = int(raw, 16) if raw.lower().startswith('0x') else (int(raw) if raw else 0)
@@ -4698,9 +4710,9 @@ class BatchFrameConfigDialog(RuleConfigDialog):
         unit_layout.addWidget(name_edit)
 
         length_spin = QSpinBox()
-        length_spin.setRange(1, 255)
+        length_spin.setRange(1, MAX_FRAME_UNIT_LENGTH)
         length_spin.setValue(unit_data.get('length', 1))
-        length_spin.setMaximumWidth(60)
+        length_spin.setMaximumWidth(70)
         unit_layout.addWidget(length_spin)
 
         type_combo = QComboBox()
@@ -4802,6 +4814,7 @@ class BatchFrameConfigDialog(RuleConfigDialog):
                 step_spin.setVisible(False)
                 num_mode_combo.setVisible(False)
                 length_spin.setEnabled(True)
+                length_spin.setMaximum(MAX_FRAME_UNIT_LENGTH)
             elif t == 'wildcard':
                 value_edit.setEnabled(False)
                 value_edit.setPlaceholderText(tr("任意值（按长度跳过）"))
@@ -4812,6 +4825,7 @@ class BatchFrameConfigDialog(RuleConfigDialog):
                 step_spin.setVisible(False)
                 num_mode_combo.setVisible(False)
                 length_spin.setEnabled(True)
+                length_spin.setMaximum(MAX_FRAME_UNIT_LENGTH)
             elif t == 'checksum':
                 value_edit.setEnabled(False)
                 value_edit.setPlaceholderText(tr("校验自动比对"))
@@ -4832,6 +4846,7 @@ class BatchFrameConfigDialog(RuleConfigDialog):
                 step_spin.setVisible(True)
                 num_mode_combo.setVisible(True)
                 length_spin.setEnabled(True)
+                length_spin.setMaximum(MAX_INCREMENT_UNIT_LENGTH)
 
         type_combo.currentIndexChanged.connect(lambda _: update_controls())
         update_controls()

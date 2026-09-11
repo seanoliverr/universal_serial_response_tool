@@ -42,3 +42,8 @@ FLOWCONTROLS = ['None', 'RTS/CTS', 'XON/XOFF']
 # UI 配置
 DEFAULT_FONT_SIZE = 9
 MAX_HISTORY_COUNT = 20
+
+# 帧单元长度上限：fixed / wildcard 等按字节填充的单元放开到 65535；
+# increment 数值单元按二进制宽度实际有意义的上限为 16 字节（再大起始值无法表达）。
+MAX_FRAME_UNIT_LENGTH = 65535
+MAX_INCREMENT_UNIT_LENGTH = 16
