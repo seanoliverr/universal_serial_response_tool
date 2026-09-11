@@ -1865,7 +1865,7 @@ class UartAssistantWindow(QMainWindow):
             byte_count = len(text.encode('utf-8'))
         self.send_stats_label.setText(f"{self._tr('长度：')}{byte_count}{self._tr(' 字节')}")
     
-    def _build_increment_bytes(self, unit, iteration=0):
+    def _build_increment_bytes(self, unit, iteration=0, fmt='HEX'):
         """构造「递增值」单元的字节序列（批量发送与自动应答共用）。
 
         unit 相关字段：
@@ -1877,6 +1877,10 @@ class UartAssistantWindow(QMainWindow):
 
         iteration 为当前轮次（从 0 开始），实际值 = 起始值 + iteration * step，
         超出长度可表示范围后取模回绕（Python 取模结果恒为非负，故负步进同样安全）。
+
+        fmt：'文本' 时输出 ASCII 十进制数字串（与文本格式固定值单元的编码方式对齐，
+        避免把 0x00 等不可见控制字节发给文本终端）；普通数值占 length 位、BCD 占 2*length 位，
+        右对齐补 '0'。HEX 等其他格式输出二进制 / BCD 原始字节。
         """
         length = max(1, int(unit.get('length', 1) or 1))
         raw_val = (unit.get('value', '') or '').strip()
@@ -1890,8 +1894,15 @@ class UartAssistantWindow(QMainWindow):
             step = 1
         order = 'big' if unit.get('byte_order', 'big') == 'big' else 'little'
         it = max(0, int(iteration))
+        is_bcd = unit.get('num_mode', 'normal') == 'bcd'
 
-        if unit.get('num_mode', 'normal') == 'bcd':
+        # 文本格式：统一输出 ASCII 十进制数字串；字节序仅对多字节原始数值有意义，文本下不适用。
+        if fmt == '文本':
+            width = length * 2 if is_bcd else length
+            current_dec = (start_val + it * step) % (10 ** width)
+            return str(current_dec).rjust(width, '0').encode('ascii')
+
+        if is_bcd:
             # BCD 十进制递增：十进制加步进后按 BCD 编码到 length 字节
             max_dec = 10 ** (length * 2)  # length 字节 BCD 可表示 0 ~ 10^(2L)-1
             current_dec = (start_val + it * step) % max_dec
@@ -1929,7 +1940,7 @@ class UartAssistantWindow(QMainWindow):
             elif unit_type == 'wildcard':
                 data.extend(b'\x00' * length)
             elif unit_type == 'increment':
-                data.extend(self._build_increment_bytes(unit, iteration))
+                data.extend(self._build_increment_bytes(unit, iteration, fmt))
             elif unit_type == 'checksum':
                 algo = unit.get('algorithm', 'xor8')
                 if algo == 'xor':
@@ -1961,11 +1972,20 @@ class UartAssistantWindow(QMainWindow):
         dialog = BatchFrameConfigDialog(self, rule)
         if dialog.exec_():
             try:
-                frame_data = self.build_batch_frame_bytes(dialog.frame_units, dialog.frame_format)
-                content_edit.setText(' '.join(f'{b:02X}' for b in frame_data))
-                format_combo.setCurrentText('HEX')
+                frame_fmt = dialog.frame_format
+                frame_data = self.build_batch_frame_bytes(dialog.frame_units, frame_fmt)
+                # 预览内容需与所选发送格式对齐：文本帧按 UTF-8 可逆显示，HEX 帧按两位十六进制显示。
+                # 实际发送始终以 frame_units 动态组帧为准，此处文本框仅作预览/兼容旧读取路径。
+                if frame_fmt == '文本':
+                    preview = frame_data.decode('utf-8', errors='replace')
+                    preview = preview.replace('\r', '\\r').replace('\n', '\\n').replace('\t', '\\t')
+                    content_edit.setText(preview)
+                    format_combo.setCurrentText('文本')
+                else:
+                    content_edit.setText(' '.join(f'{b:02X}' for b in frame_data))
+                    format_combo.setCurrentText('HEX')
                 frame_state['frame_units'] = dialog.frame_units
-                frame_state['frame_format'] = dialog.frame_format
+                frame_state['frame_format'] = frame_fmt
             except Exception as e:
                 QMessageBox.critical(self, self._tr("错误"), f"{self._tr('生成指令失败：')}{str(e)}")
     
@@ -3713,7 +3733,7 @@ class UartAssistantWindow(QMainWindow):
                     print(f"[DEBUG] 应答引用单元未找到捕获值: {ref_name}")
                 data.extend(ref_bytes)
             elif unit_type == 'increment':
-                data.extend(self._build_increment_bytes(unit, iteration))
+                data.extend(self._build_increment_bytes(unit, iteration, fmt))
             elif unit_type == 'checksum':
                 algo = unit.get('algorithm', 'xor8')
                 # 兼容旧配置的算法名
