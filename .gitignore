@@ -28,8 +28,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# 发布物料（仅本地备用，不会入库）
-release/
+# 发布物料：入库保留最新版本（release 下的 exe 不受上面 *.exe 忽略影响）
+!release/*.exe
 
 # 本地数据模拟/诊断脚本及其输出（仅排查用，不入库）
 sim_*.py
