@@ -338,6 +338,40 @@ class PortComboBox(QComboBox):
         super().showPopup()
 
 
+class TitledActionGroup(QGroupBox):
+    """标题行右侧可放置操作按钮的分组框。
+
+    通过 add_title_action() 加入的按钮不作为内容参与布局，而是作为浮动
+    子控件定位在分组标题同一行的最右端，从而无需为其额外占用一整行。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._title_actions = []
+
+    def add_title_action(self, widget):
+        widget.setParent(self)
+        self._title_actions.append(widget)
+        widget.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._title_actions:
+            return
+        margin = 8
+        gap = 2
+        h = 20
+        y = max(0, (self.fontMetrics().height() - h) // 2)
+        x = self.width() - margin
+        for w in reversed(self._title_actions):
+            w.setFixedHeight(h)
+            w.adjustSize()
+            width = max(w.sizeHint().width(), w.width())
+            x -= width
+            w.setGeometry(x, y, width, h)
+            x -= gap
+
+
 class ReceiveThread(QThread):
     """串口接收线程"""
     data_received = pyqtSignal(bytes)
@@ -689,15 +723,15 @@ class UartAssistantWindow(QMainWindow):
         # 表头
         if hasattr(self, 'commands_table'):
             self.commands_table.setHorizontalHeaderLabels(
-                [self._tr("选中"), self._tr("名称"), self._tr("指令"),
-                 self._tr("格式"), self._tr("操作")])
+                [self._tr("操作"), self._tr("选中"), self._tr("名称"),
+                 self._tr("指令"), self._tr("格式")])
         if hasattr(self, 'rules_table'):
             self.rules_table.setHorizontalHeaderLabels(
-                [self._tr("启用"), self._tr("名称"), self._tr("匹配条件"),
-                 self._tr("应答数据"), self._tr("操作")])
+                [self._tr("操作"), self._tr("启用"), self._tr("名称"),
+                 self._tr("匹配条件"), self._tr("应答数据")])
         if hasattr(self, 'quick_commands_table'):
             self.quick_commands_table.setHorizontalHeaderLabels(
-                [self._tr("名称"), self._tr("指令"), self._tr("格式"), self._tr("操作")])
+                [self._tr("操作"), self._tr("名称"), self._tr("指令"), self._tr("格式")])
             # 重新构建操作列按钮以刷新按钮文本
             self.refresh_quick_commands_table()
         # 连接状态 / 按钮
@@ -792,18 +826,18 @@ class UartAssistantWindow(QMainWindow):
         # 指令表格
         self.commands_table = QTableWidget()
         self.commands_table.setColumnCount(5)
-        self.commands_table.setHorizontalHeaderLabels([self._tr("选中"), self._tr("名称"), self._tr("指令"), self._tr("格式"), self._tr("操作")])
-        # 允许用户手动拖动列宽（Interactive）；最后一列自适应填满剩余空间
+        self.commands_table.setHorizontalHeaderLabels([self._tr("操作"), self._tr("选中"), self._tr("名称"), self._tr("指令"), self._tr("格式")])
+        # 允许用户手动拖动列宽（Interactive）；指令列自适应填满剩余空间
         h_header = self.commands_table.horizontalHeader()
         h_header.setSectionResizeMode(QHeaderView.Interactive)
-        h_header.setStretchLastSection(True)
+        h_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        h_header.setStretchLastSection(False)
         # 允许用户手动拖动行高
         self.commands_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.commands_table.setColumnWidth(0, 100)
-        self.commands_table.setColumnWidth(1, 100)
-        self.commands_table.setColumnWidth(2, 200)
-        self.commands_table.setColumnWidth(3, 60)
-        self.commands_table.setColumnWidth(4, 120)
+        self.commands_table.setColumnWidth(0, 52)   # 操作：单个按钮，容纳2个汉字
+        self.commands_table.setColumnWidth(1, 110)  # 选中：复选框 + 间隔标签
+        self.commands_table.setColumnWidth(2, 100)  # 名称
+        self.commands_table.setColumnWidth(4, 60)   # 格式
         # 允许右键菜单：上移/下移
         self.commands_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.commands_table.customContextMenuRequested.connect(self.on_batch_commands_context_menu)
@@ -959,17 +993,17 @@ class UartAssistantWindow(QMainWindow):
         
         self.rules_table = QTableWidget()
         self.rules_table.setColumnCount(5)
-        self.rules_table.setHorizontalHeaderLabels([self._tr("启用"), self._tr("名称"), self._tr("匹配条件"), self._tr("应答数据"), self._tr("操作")])
-        # 允许用户手动拖动列宽/行高
+        self.rules_table.setHorizontalHeaderLabels([self._tr("操作"), self._tr("启用"), self._tr("名称"), self._tr("匹配条件"), self._tr("应答数据")])
+        # 允许用户手动拖动列宽/行高；匹配条件、应答数据两列均分填满剩余空间
         h_header = self.rules_table.horizontalHeader()
         h_header.setSectionResizeMode(QHeaderView.Interactive)
-        h_header.setStretchLastSection(True)
+        h_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        h_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        h_header.setStretchLastSection(False)
         self.rules_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.rules_table.setColumnWidth(0, 60)
-        self.rules_table.setColumnWidth(1, 100)
-        self.rules_table.setColumnWidth(2, 160)
-        self.rules_table.setColumnWidth(3, 160)
-        self.rules_table.setColumnWidth(4, 80)
+        self.rules_table.setColumnWidth(0, 52)  # 操作：单个按钮，容纳2个汉字
+        self.rules_table.setColumnWidth(1, 50)  # 启用
+        self.rules_table.setColumnWidth(2, 90)  # 名称
         # 加高规则表，更完整显示规则列表内容
         self.rules_table.setMinimumHeight(220)
         # 允许右键菜单：上移/下移
@@ -1020,16 +1054,16 @@ class UartAssistantWindow(QMainWindow):
         self.quick_commands_table = QTableWidget()
         self.quick_commands_table.setColumnCount(4)
         self.quick_commands_table.setHorizontalHeaderLabels(
-            [self._tr("名称"), self._tr("指令"), self._tr("格式"), self._tr("操作")])
-        # 允许用户手动拖动列宽/行高
+            [self._tr("操作"), self._tr("名称"), self._tr("指令"), self._tr("格式")])
+        # 允许用户手动拖动列宽/行高；指令列自适应填满剩余空间
         h_header = self.quick_commands_table.horizontalHeader()
         h_header.setSectionResizeMode(QHeaderView.Interactive)
-        h_header.setStretchLastSection(True)
+        h_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        h_header.setStretchLastSection(False)
         self.quick_commands_table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.quick_commands_table.setColumnWidth(0, 100)
-        self.quick_commands_table.setColumnWidth(1, 220)
-        self.quick_commands_table.setColumnWidth(2, 60)
-        self.quick_commands_table.setColumnWidth(3, 160)
+        self.quick_commands_table.setColumnWidth(0, 108)  # 操作：编辑+发送两个按钮
+        self.quick_commands_table.setColumnWidth(1, 100)  # 名称
+        self.quick_commands_table.setColumnWidth(3, 60)   # 格式
         self.quick_commands_table.setMinimumHeight(220)
         # 允许右键菜单：上移/下移
         self.quick_commands_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1132,23 +1166,25 @@ class UartAssistantWindow(QMainWindow):
         self.version_label = QLabel(f"{self._tr('版本: ')}v{APP_VERSION}")
         self.statusBar.addPermanentWidget(self.version_label)
         
-        # 右上角齿轮设置按钮（放在菜单栏右侧角落，靠近最小化按钮）
-        self.create_settings_menu()
-        
+        # 帮助(?)与设置(⚙)按钮在「串口设置」分组标题行右侧创建（见 create_serial_settings），
+        # 不再占用菜单栏，从而省下菜单栏那一行的高度
+
         self.update_status_bar()
         print("[DEBUG] 界面初始化完成")
     
     def create_settings_menu(self):
-        """在菜单栏右上角创建齿轮设置按钮 + 帮助按钮，含语言切换子菜单"""
-        from PyQt5.QtWidgets import QToolButton, QMenu, QActionGroup, QWidget, QHBoxLayout
-        menubar = self.menuBar()
+        """创建齿轮设置按钮 + 帮助按钮（含语言切换子菜单）。
+
+        不再占用菜单栏，按钮返回后由「串口设置」分组标题行右侧挂载，节省一行高度。
+        """
+        from PyQt5.QtWidgets import QToolButton, QMenu, QActionGroup
 
         # 帮助按钮 (?)
         help_btn = QToolButton()
         help_btn.setText("?")
         help_btn.setToolTip(self._tr("使用说明"))
         help_btn.setAutoRaise(True)
-        help_btn.setStyleSheet("QToolButton { font-size: 16px; font-weight: bold; border: none; padding: 2px 8px; }")
+        help_btn.setStyleSheet("QToolButton { font-size: 14px; font-weight: bold; border: none; padding: 0 4px; }")
         help_btn.clicked.connect(self.open_help_dialog)
         self.help_btn = help_btn
 
@@ -1157,7 +1193,7 @@ class UartAssistantWindow(QMainWindow):
         gear_btn.setToolTip(self._tr("设置"))
         gear_btn.setPopupMode(QToolButton.InstantPopup)
         gear_btn.setAutoRaise(True)
-        gear_btn.setStyleSheet("QToolButton { font-size: 16px; border: none; padding: 2px 8px; }"
+        gear_btn.setStyleSheet("QToolButton { font-size: 14px; border: none; padding: 0 4px; }"
                                "QToolButton::menu-indicator { image: none; }")
 
         settings_menu = QMenu(gear_btn)
@@ -1197,16 +1233,8 @@ class UartAssistantWindow(QMainWindow):
         self.action_console_log.triggered.connect(self.on_toggle_console_log)
 
         gear_btn.setMenu(settings_menu)
-
-        # 用一个容器把两个按钮放到 TopRightCorner
-        corner_widget = QWidget()
-        corner_layout = QHBoxLayout(corner_widget)
-        corner_layout.setContentsMargins(0, 0, 0, 0)
-        corner_layout.setSpacing(0)
-        corner_layout.addWidget(help_btn)
-        corner_layout.addWidget(gear_btn)
-        menubar.setCornerWidget(corner_widget, Qt.TopRightCorner)
         self.gear_btn = gear_btn
+        return help_btn, gear_btn
     
     def open_help_dialog(self):
         """打开使用说明对话框"""
@@ -1420,8 +1448,12 @@ class UartAssistantWindow(QMainWindow):
     
     def create_serial_settings(self, parent_layout):
         """创建串口设置区域"""
-        settings_group = QGroupBox()
+        settings_group = TitledActionGroup()
         self._reg(settings_group.setTitle, "串口设置")
+        # 帮助(?)与设置(⚙)按钮挂到标题行最右端，不再单独占用菜单栏一行
+        help_btn, gear_btn = self.create_settings_menu()
+        settings_group.add_title_action(help_btn)
+        settings_group.add_title_action(gear_btn)
         settings_layout = QVBoxLayout(settings_group)
         settings_layout.setContentsMargins(5, 5, 5, 5)
         settings_layout.setSpacing(5)
@@ -2320,10 +2352,10 @@ class UartAssistantWindow(QMainWindow):
     
     def delete_batch_command(self):
         """删除批量发送指令"""
-        # 收集所有选中的指令索引（第 0 列是容器 QWidget，需从中取出 QCheckBox）
+        # 收集所有选中的指令索引（第 1 列是容器 QWidget，需从中取出 QCheckBox）
         selected_indices = []
         for i in range(min(self.commands_table.rowCount(), len(self.batch_commands))):
-            cell = self.commands_table.cellWidget(i, 0)
+            cell = self.commands_table.cellWidget(i, 1)
             check_box = cell.findChild(QCheckBox) if cell else None
             if check_box is not None and check_box.isChecked():
                 selected_indices.append(i)
@@ -2712,26 +2744,37 @@ class UartAssistantWindow(QMainWindow):
         self.quick_commands_table.selectRow(dst)
     
     def refresh_quick_commands_table(self):
-        """刷新快捷指令表格：名称/指令/格式/操作(编辑+发送)"""
+        """刷新快捷指令表格：操作(编辑+发送)/名称/指令/格式"""
         self.quick_commands_table.setRowCount(len(self.quick_commands))
         for i, cmd in enumerate(self.quick_commands):
-            self.quick_commands_table.setItem(i, 0, QTableWidgetItem(cmd.get('name', f'指令{i + 1}')))
-            self.quick_commands_table.setItem(i, 1, QTableWidgetItem(cmd.get('content', '')))
-            self.quick_commands_table.setItem(i, 2, QTableWidgetItem(cmd.get('format', '文本')))
-            
-            # 操作列：编辑 + 发送
+            # 操作列（第0列）：编辑 + 发送
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
             action_layout.setContentsMargins(2, 2, 2, 2)
-            action_layout.setSpacing(4)
-            edit_btn = QPushButton(self._tr("编辑"))
+            action_layout.setSpacing(2)
+            edit_btn = self._make_table_action_btn(self._tr("编辑"))
             edit_btn.clicked.connect(lambda checked, idx=i: self.edit_quick_command_idx(idx))
             action_layout.addWidget(edit_btn)
-            send_btn = QPushButton(self._tr("发送"))
+            send_btn = self._make_table_action_btn(self._tr("发送"))
             send_btn.clicked.connect(lambda checked, idx=i: self.send_quick_command(idx))
             action_layout.addWidget(send_btn)
-            self.quick_commands_table.setCellWidget(i, 3, action_widget)
-    
+            self.quick_commands_table.setCellWidget(i, 0, action_widget)
+
+            self.quick_commands_table.setItem(i, 1, QTableWidgetItem(cmd.get('name', f'指令{i + 1}')))
+            self.quick_commands_table.setItem(i, 2, QTableWidgetItem(cmd.get('content', '')))
+            self.quick_commands_table.setItem(i, 3, QTableWidgetItem(cmd.get('format', '文本')))
+
+    def _make_table_action_btn(self, text):
+        """生成列表操作列的窄按钮：宽度仅容纳2个汉字，不被遮挡。"""
+        btn = QPushButton(text)
+        # 收紧内边距，避免默认样式把按钮撑宽
+        btn.setStyleSheet("QPushButton { padding: 1px 2px; }")
+        fm = btn.fontMetrics()
+        width = fm.horizontalAdvance(text) if hasattr(fm, 'horizontalAdvance') else fm.width(text)
+        # 文字宽 + 左右内边距(4) + 边框(2) + 少量余量(6)
+        btn.setFixedWidth(width + 12)
+        return btn
+
     def refresh_commands_table(self):
         """刷新指令表格"""
         self.commands_table.setRowCount(len(self.batch_commands))
@@ -2739,9 +2782,14 @@ class UartAssistantWindow(QMainWindow):
         use_global = (getattr(self, 'batch_fixed_interval_check', None) is not None
                       and self.batch_fixed_interval_check.isChecked())
         global_ms = int(self.batch_interval_spin.value()) if use_global else 0
-        
+
         for i, cmd in enumerate(self.batch_commands):
-            # 选中复选框 + 间隔标签
+            # 操作列（第0列）：编辑按钮
+            edit_btn = self._make_table_action_btn(self._tr("编辑"))
+            edit_btn.clicked.connect(lambda checked, idx=i: self.edit_batch_command_idx(idx))
+            self.commands_table.setCellWidget(i, 0, edit_btn)
+
+            # 选中复选框 + 间隔标签（第1列）
             # - 全部固定间隔=True：所有行显示全局间隔
             # - 全部固定间隔=False：仅在指令开启了"指定发送间隔"时显示自身间隔
             cell = QWidget()
@@ -2762,24 +2810,19 @@ class UartAssistantWindow(QMainWindow):
                 interval_label.setStyleSheet("color: #888;")
                 cell_layout.addWidget(interval_label)
             cell_layout.addStretch()
-            self.commands_table.setCellWidget(i, 0, cell)
-            
+            self.commands_table.setCellWidget(i, 1, cell)
+
             # 指令名称
             name_item = QTableWidgetItem(cmd.get('name', f'指令{i + 1}'))
-            self.commands_table.setItem(i, 1, name_item)
-            
+            self.commands_table.setItem(i, 2, name_item)
+
             # 指令内容
             content_item = QTableWidgetItem(cmd.get('content', ''))
-            self.commands_table.setItem(i, 2, content_item)
-            
+            self.commands_table.setItem(i, 3, content_item)
+
             # 格式
             format_item = QTableWidgetItem(cmd.get('format', '文本'))
-            self.commands_table.setItem(i, 3, format_item)
-            
-            # 操作按钮
-            edit_btn = QPushButton(self._tr("编辑"))
-            edit_btn.clicked.connect(lambda checked, idx=i: self.edit_batch_command_idx(idx))
-            self.commands_table.setCellWidget(i, 4, edit_btn)
+            self.commands_table.setItem(i, 4, format_item)
     
     def update_command_enabled(self, index, state):
         """更新指令的选中状态"""
@@ -2790,7 +2833,7 @@ class UartAssistantWindow(QMainWindow):
     def edit_batch_command_idx(self, index):
         """通过索引编辑指令"""
         if 0 <= index < len(self.batch_commands):
-            self.commands_table.setCurrentCell(index, 0)  # 使用 setCurrentCell 代替 setCurrentRow
+            self.commands_table.setCurrentCell(index, 2)  # 定位到名称列（第0列已为操作按钮）
             self.edit_batch_command()
     
     def on_wrap_toggled(self, checked):
@@ -3109,28 +3152,29 @@ class UartAssistantWindow(QMainWindow):
         """刷新规则表格"""
         self.rules_table.setRowCount(len(self.reply_rules))
         for i, rule in enumerate(self.reply_rules):
+            # 操作列（第0列）：编辑按钮
+            edit_btn = self._make_table_action_btn(self._tr("编辑"))
+            edit_btn.clicked.connect(lambda checked, idx=i: self.edit_rule(idx))
+            self.rules_table.setCellWidget(i, 0, edit_btn)
+
             check = QCheckBox()
             check.setChecked(rule.get('enabled', True))
             check.toggled.connect(lambda checked, idx=i: self.toggle_rule_enabled(idx, checked))
-            self.rules_table.setCellWidget(i, 0, check)
-            
+            self.rules_table.setCellWidget(i, 1, check)
+
             name_item = QTableWidgetItem(rule.get('name', f'规则{i+1}'))
-            self.rules_table.setItem(i, 1, name_item)
-            
+            self.rules_table.setItem(i, 2, name_item)
+
             match_preview = self.get_frame_preview(rule.get('match_frame', []))
-            self.rules_table.setItem(i, 2, QTableWidgetItem(match_preview))
-            
+            self.rules_table.setItem(i, 3, QTableWidgetItem(match_preview))
+
             responses = self._get_rule_responses(rule)
             first_frame = responses[0]['frame'] if responses else []
             preview_text = self.get_frame_preview(first_frame)
             if len(responses) > 1:
                 preview_text = f"{preview_text} (+{len(responses) - 1})"
             response_preview = preview_text
-            self.rules_table.setItem(i, 3, QTableWidgetItem(response_preview))
-            
-            edit_btn = QPushButton(self._tr("编辑"))
-            edit_btn.clicked.connect(lambda checked, idx=i: self.edit_rule(idx))
-            self.rules_table.setCellWidget(i, 4, edit_btn)
+            self.rules_table.setItem(i, 4, QTableWidgetItem(response_preview))
         
         self.rules_count_label.setText(f"{self._tr('已配置 ')}{len(self.reply_rules)}{self._tr(' 条规则')}")
     
@@ -3254,7 +3298,7 @@ class UartAssistantWindow(QMainWindow):
         # 收集所有选中的规则索引
         selected_indices = []
         for i in range(min(self.rules_table.rowCount(), len(self.reply_rules))):
-            check_box = self.rules_table.cellWidget(i, 0)
+            check_box = self.rules_table.cellWidget(i, 1)
             if check_box and check_box.isChecked():
                 selected_indices.append(i)
         
