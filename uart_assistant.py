@@ -116,6 +116,13 @@ EN_TRANSLATIONS = {
     "语言": "Language",
     "中文": "中文",
     "English": "English",
+    # 齿轮菜单 - 系统日志排查后门
+    "系统日志(仅排查问题用)": "System Log (Troubleshooting Only)",
+    "系统日志": "System Log",
+    "系统日志已开启，之后的运行信息将写入：": "System log enabled. Subsequent runtime output will be written to:",
+    "该设置已保存，重启程序后仍保持开启。": "This setting is saved and remains enabled after restart.",
+    "系统日志开启失败，请检查日志保存路径是否可写。": "Failed to enable system log. Please check whether the log save path is writable.",
+    "系统日志已关闭，重启程序后保持关闭。": "System log disabled. It remains off after restart.",
     # 表头
     "选中": "Select",
     "指令": "Command",
@@ -321,6 +328,16 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y()
 
 
+class PortComboBox(QComboBox):
+    """端口下拉框：点击展开（showPopup）时发出 about_to_popup 信号，
+    用于在弹出列表前自动重新扫描串口，省去独立的刷新按钮。"""
+    about_to_popup = pyqtSignal()
+
+    def showPopup(self):
+        self.about_to_popup.emit()
+        super().showPopup()
+
+
 class ReceiveThread(QThread):
     """串口接收线程"""
     data_received = pyqtSignal(bytes)
@@ -424,7 +441,8 @@ class UartAssistantWindow(QMainWindow):
         
         # 日志相关配置
         self.save_receive_log = True
-        self.save_console_log = True
+        # 系统日志（控制台/调试日志）默认不保存，仅在齿轮菜单的排查后门中手动开启
+        self.save_console_log = False
         self.log_save_path = ''
         self.receive_log_file = None
         self.receive_log_filename = None
@@ -452,6 +470,10 @@ class UartAssistantWindow(QMainWindow):
         self.load_quick_commands()
         self.setup_shortcuts()
         self.start_speed_timer()
+
+        # 系统（控制台）日志默认关闭，仅当用户在齿轮菜单排查后门中开启后，启动时才初始化
+        if self.save_console_log:
+            self.init_console_log_file()
     
     def init_log_file(self):
         """初始化日志文件"""
@@ -487,7 +509,13 @@ class UartAssistantWindow(QMainWindow):
             self.log_file = None
     
     def init_console_log_file(self):
-        """初始化控制台日志文件"""
+        """初始化控制台（系统）日志文件
+
+        幂等：若已在记录系统日志则不重复重定向，避免文件句柄泄漏与 stdout 嵌套包装。
+        """
+        # 已存在有效日志句柄，说明系统日志已开启，直接返回
+        if getattr(self, 'console_log_file', None) is not None:
+            return
         try:
             # 确定日志目录位置
             log_dir = self.log_save_path or self.get_default_log_dir()
@@ -551,25 +579,26 @@ class UartAssistantWindow(QMainWindow):
             self.console_log_file = None
     
     def close_console_log_file(self):
-        """关闭控制台日志文件"""
-        # 关闭控制台日志文件
-        if hasattr(self, 'console_log_file') and self.console_log_file:
+        """关闭控制台（系统）日志文件并恢复标准输出/标准错误"""
+        # 先取出并关闭日志句柄（关闭前不再向其写入，避免把关闭信息写进日志）
+        f = getattr(self, 'console_log_file', None)
+        if f:
             try:
-                self.console_log_file.close()
-                self.console_log_file = None
-                print("[DEBUG] 控制台日志文件已关闭")
+                f.close()
             except Exception as e:
-                print(f"[DEBUG] 关闭控制台日志文件失败: {e}")
-        
-        # 恢复标准输出和标准错误
+                print(f"[DEBUG] 关闭系统日志文件失败: {e}")
+            self.console_log_file = None
+
+        # 恢复标准输出和标准错误（恢复目标是开启前捕获的、None 安全的原始流）
         if hasattr(self, 'original_stdout') and hasattr(self, 'original_stderr'):
             import sys
             try:
                 sys.stdout = self.original_stdout
                 sys.stderr = self.original_stderr
-                print("[DEBUG] 标准输出和标准错误已恢复")
             except Exception as e:
                 print(f"[DEBUG] 恢复标准输出和标准错误失败: {e}")
+        if f:
+            print("[DEBUG] 系统日志已关闭")
     
     def close_log_file(self):
         """关闭所有日志文件"""
@@ -577,6 +606,43 @@ class UartAssistantWindow(QMainWindow):
         self.close_receive_log_file()
         # 关闭控制台日志文件
         self.close_console_log_file()
+
+    def on_toggle_console_log(self, checked):
+        """齿轮菜单排查后门：开启/关闭系统（控制台）日志。
+
+        开启后立即初始化系统日志并持久化保存到配置；关闭则停止记录。
+        该选项默认关闭，仅供开发/技术支持排查问题时使用。
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        if checked:
+            self.save_console_log = True
+            self.save_config()
+            self.init_console_log_file()
+            # 初始化成功后 console_log_file 非空；据此给出真实落盘路径
+            if getattr(self, 'console_log_file', None):
+                log_dir = os.path.dirname(self.console_log_filename)
+                QMessageBox.information(
+                    self, self._tr("系统日志"),
+                    self._tr("系统日志已开启，之后的运行信息将写入：") + "\n"
+                    + log_dir + "\n\n" + self._tr("该设置已保存，重启程序后仍保持开启。"))
+            else:
+                QMessageBox.warning(
+                    self, self._tr("系统日志"),
+                    self._tr("系统日志开启失败，请检查日志保存路径是否可写。"))
+                # 初始化失败：回滚勾选态与配置
+                self.save_console_log = False
+                self.save_config()
+                if hasattr(self, 'action_console_log'):
+                    self.action_console_log.blockSignals(True)
+                    self.action_console_log.setChecked(False)
+                    self.action_console_log.blockSignals(False)
+        else:
+            self.save_console_log = False
+            self.save_config()
+            self.close_console_log_file()
+            QMessageBox.information(
+                self, self._tr("系统日志"),
+                self._tr("系统日志已关闭，重启程序后保持关闭。"))
     
     # ==================== 国际化辅助方法 ====================
     def _tr(self, s):
@@ -1122,6 +1188,14 @@ class UartAssistantWindow(QMainWindow):
         self.action_display_settings = settings_menu.addAction(self._tr("换行间隔..."))
         self.action_display_settings.triggered.connect(self.open_display_settings_dialog)
 
+        # 分隔线 + 系统日志排查后门（默认关闭，仅排查问题时手动开启；开启后持久化，重启生效）
+        settings_menu.addSeparator()
+        self.action_console_log = settings_menu.addAction(self._tr("系统日志(仅排查问题用)"))
+        self.action_console_log.setCheckable(True)
+        # 初始勾选态与配置一致（UI 在 load_config 之后创建）
+        self.action_console_log.setChecked(bool(getattr(self, 'save_console_log', False)))
+        self.action_console_log.triggered.connect(self.on_toggle_console_log)
+
         gear_btn.setMenu(settings_menu)
 
         # 用一个容器把两个按钮放到 TopRightCorner
@@ -1239,8 +1313,10 @@ class UartAssistantWindow(QMainWindow):
             else:
                 self.close_receive_log_file()
 
-            # 应用控制台日志设置
+            # 应用控制台日志设置（系统日志后门已开启时，先关后开以应用新的保存路径；
+            # 默认关闭时此处为空操作）
             if self.save_console_log:
+                self.close_console_log_file()
                 self.init_console_log_file()
             else:
                 self.close_console_log_file()
@@ -1261,14 +1337,19 @@ class UartAssistantWindow(QMainWindow):
             return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log')
     
     def init_receive_log_file(self):
-        """初始化接收日志文件"""
+        """初始化接收日志文件
+
+        注意：这里只确定文件路径并创建一个空文件，不长期持有文件句柄，
+        这样在串口打开期间日志文件也可被外部随时删除/重命名。
+        实际写入见 write_receive_log()，每次短开追加，文件被删后会自动重建。
+        """
         if not self.save_receive_log or not self.is_open:
             return
-        
+
         try:
             log_dir = self.log_save_path or self.get_default_log_dir()
             os.makedirs(log_dir, exist_ok=True)
-            
+
             if self.use_custom_log_name and self.custom_log_name:
                 # 使用自定义文件名
                 custom_name = self.custom_log_name
@@ -1281,25 +1362,41 @@ class UartAssistantWindow(QMainWindow):
                 port = self.port_combo.currentText().replace(':', '').replace('\\', '').replace('/', '')
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 self.receive_log_filename = os.path.join(log_dir, f"{timestamp}_{port}.log")
-            
-            self.receive_log_file = open(self.receive_log_filename, 'w', encoding='utf-8')
-            
+
+            # 创建/清空日志文件后立即关闭，不占用句柄
+            with open(self.receive_log_filename, 'w', encoding='utf-8'):
+                pass
+
             self.update_current_log_label()
             print(f"[DEBUG] 接收日志文件已创建: {self.receive_log_filename}")
         except Exception as e:
             print(f"[DEBUG] 初始化接收日志文件失败: {e}")
-    
+
+    def write_receive_log(self, log_text):
+        """短开文件句柄追加写入一行，写完立即关闭，避免长期占用导致无法删除。
+
+        若日志文件已被外部删除（或重命名），则按原路径重新创建后继续写入；
+        连续写入失败（如目录被删/磁盘不可用）时安静返回，不影响串口收发。
+        """
+        if not self.save_receive_log or not self.receive_log_filename:
+            return
+        try:
+            # 文件已被删除时自动重建（目录可能也被一起删了，需一并补建）
+            if not os.path.exists(self.receive_log_filename):
+                os.makedirs(os.path.dirname(self.receive_log_filename), exist_ok=True)
+            # 追加模式短开短关，句柄在 with 结束时释放
+            with open(self.receive_log_filename, 'a', encoding='utf-8') as f:
+                f.write(log_text + '\n')
+        except Exception as e:
+            print(f"[ERROR] 写入日志文件失败: {e}")
+
     def close_receive_log_file(self):
-        """关闭接收日志文件"""
-        if self.receive_log_file:
-            try:
-                self.receive_log_file.close()
-                self.receive_log_file = None
-                self.receive_log_filename = None
-                self.update_current_log_label()
-                print("[DEBUG] 接收日志文件已关闭")
-            except Exception as e:
-                print(f"[DEBUG] 关闭接收日志文件失败: {e}")
+        """关闭接收日志（仅清理路径状态；无句柄需要关闭）"""
+        if self.receive_log_filename:
+            self.receive_log_file = None
+            self.receive_log_filename = None
+            self.update_current_log_label()
+            print("[DEBUG] 接收日志已停止（文件句柄已释放）")
     
     def update_current_log_label(self):
         """更新当前日志文件标签"""
@@ -1342,15 +1439,12 @@ class UartAssistantWindow(QMainWindow):
             field_layout.addWidget(widget)
             return field
 
-        self.port_combo = QComboBox()
+        self.port_combo = PortComboBox()
         self.port_combo.setMinimumWidth(80)
         self.port_combo.setMaximumHeight(25)
         self.refresh_ports()
-
-        refresh_btn = QPushButton()
-        self._reg(refresh_btn.setText, "刷新")
-        refresh_btn.setMaximumHeight(25)
-        refresh_btn.clicked.connect(self.refresh_ports)
+        # 点击下拉框展开时自动重新扫描串口，替代独立的刷新按钮
+        self.port_combo.about_to_popup.connect(self.refresh_ports)
 
         port_field = QWidget()
         port_layout = QHBoxLayout(port_field)
@@ -1358,7 +1452,6 @@ class UartAssistantWindow(QMainWindow):
         port_layout.setSpacing(3)
         port_layout.addWidget(self._mklabel("端口:"))
         port_layout.addWidget(self.port_combo)
-        port_layout.addWidget(refresh_btn)
         top_layout.addWidget(port_field)
 
         self.baudrate_combo = QComboBox()
@@ -1479,10 +1572,17 @@ class UartAssistantWindow(QMainWindow):
     
     def refresh_ports(self):
         print("[DEBUG] 刷新串口列表")
+        # 记录当前选中项，刷新后尽量保留（点击下拉框自动刷新时不打断已选端口）
+        prev_port = self.port_combo.currentText()
+        self.port_combo.blockSignals(True)
         self.port_combo.clear()
         ports = serial.tools.list_ports.comports()
         for port in ports:
             self.port_combo.addItem(port.device)
+        restore_index = self.port_combo.findText(prev_port)
+        if restore_index >= 0:
+            self.port_combo.setCurrentIndex(restore_index)
+        self.port_combo.blockSignals(False)
         print(f"[DEBUG] 找到串口: {[port.device for port in ports]}")
     
     def toggle_serial(self):
@@ -1720,34 +1820,18 @@ class UartAssistantWindow(QMainWindow):
         finally:
             receive_text.setUpdatesEnabled(True)
         
-        # 将显示的内容写入接收日志文件（按字节/时间阈值刷盘，避免每条都 fsync 阻塞主线程）
-        if self.save_receive_log and self.receive_log_file:
+        # 将显示的内容写入接收日志文件（短开追加，不占用句柄，日志可随时删除）
+        if self.save_receive_log and self.receive_log_filename:
             log_text = text.rstrip()
             if log_text:
-                try:
-                    self.receive_log_file.write(log_text + '\n')
-                    # 累计写入字节 + 时间控制刷盘
-                    if not hasattr(self, '_log_pending_bytes'):
-                        self._log_pending_bytes = 0
-                        self._log_last_flush_ms = 0
-                    self._log_pending_bytes += len(log_text) + 1
-                    import time as _time
-                    now_ms = int(_time.monotonic() * 1000)
-                    # 4KB 未刷 或 200ms 未刷 就 flush 一次
-                    if (self._log_pending_bytes >= 4096
-                            or now_ms - self._log_last_flush_ms >= 200):
-                        self.receive_log_file.flush()
-                        self._log_pending_bytes = 0
-                        self._log_last_flush_ms = now_ms
-                    # 延迟更新日志标签，避免频繁 UI 操作
-                    if not hasattr(self, 'log_label_update_count'):
-                        self.log_label_update_count = 0
-                    self.log_label_update_count += 1
-                    if self.log_label_update_count >= 50:
-                        self.update_current_log_label()
-                        self.log_label_update_count = 0
-                except Exception as e:
-                    print(f"[ERROR] 写入日志文件失败: {e}")
+                self.write_receive_log(log_text)
+                # 延迟更新日志标签，避免频繁 UI 操作
+                if not hasattr(self, 'log_label_update_count'):
+                    self.log_label_update_count = 0
+                self.log_label_update_count += 1
+                if self.log_label_update_count >= 50:
+                    self.update_current_log_label()
+                    self.log_label_update_count = 0
     
     def flush_buffer(self):
         """刷新接收缓冲区，将数据一次性显示"""
@@ -3823,7 +3907,12 @@ class UartAssistantWindow(QMainWindow):
             
             # 加载日志配置
             self.save_receive_log = settings.value("save_receive_log", True, type=bool)
-            self.save_console_log = settings.value("save_console_log", True, type=bool)
+            # 系统日志默认关闭，且只认齿轮后门写入的新键 console_log_backdoor；
+            # 历史遗留的 save_console_log 键（旧版本默认 True）一律忽略并清除，
+            # 以保证升级后“首次启动绝不自动生成系统日志”。
+            self.save_console_log = settings.value("console_log_backdoor", False, type=bool)
+            if settings.contains("save_console_log"):
+                settings.remove("save_console_log")
             self.log_save_path = settings.value("log_save_path", "", type=str)
             self.use_custom_log_name = settings.value("use_custom_log_name", False, type=bool)
             self.custom_log_name = settings.value("custom_log_name", "", type=str)
@@ -3855,7 +3944,8 @@ class UartAssistantWindow(QMainWindow):
             
             # 保存日志配置
             settings.setValue("save_receive_log", self.save_receive_log)
-            settings.setValue("save_console_log", self.save_console_log)
+            # 系统日志开关只写齿轮后门键，不再使用旧的 save_console_log 键
+            settings.setValue("console_log_backdoor", bool(self.save_console_log))
             settings.setValue("log_save_path", self.log_save_path)
             settings.setValue("use_custom_log_name", self.use_custom_log_name)
             settings.setValue("custom_log_name", self.custom_log_name)
@@ -4910,7 +5000,7 @@ class HelpDialog(QDialog):
         "receive": """<h3>串口与接收</h3>
 <ul>
 <li><b>端口/波特率/数据位/停止位/校验位/流控制</b>：请按照对端设备一致的参数配置。</li>
-<li>点击 <b>刷新</b> 重新扫描 COM 端口。</li>
+<li>点击 <b>端口下拉框</b> 会自动重新扫描 COM 端口。</li>
 <li>点击 <b>打开串口</b> 建立连接，红灯变绿灯并显示已连接。</li>
 <li>接收显示：<b>文本 / HEX</b> 复选框互斥且至少保留一个勾选；勾选 <b>时间戳</b> 会在每条消息前显示时间。</li>
 <li><b>自动换行</b>：勾选后按窗口宽度自适应换行；不勾选时长行水平滚动查看。</li>
