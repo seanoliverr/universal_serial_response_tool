@@ -81,6 +81,7 @@ EN_TRANSLATIONS = {
     "清空": "Clear",
     # 自动应答
     "启用自动应答": "Enable Auto Reply",
+    "失配按帧头判定": "Strict Mismatch by Frame Head",
     "配置规则": "Configure Rules",
     "规则列表": "Rule List",
     "添加规则": "Add Rule",
@@ -408,7 +409,14 @@ class ReceiveThread(QThread):
 
 class UartAssistantWindow(QMainWindow):
     """主窗口类"""
-    
+
+    # 失配判定使用的「帧引导前缀」最大字节数。
+    # 取每条规则首个 fixed 单元的前若干字节（而非整个单元）作为帧头定位键：
+    # 首固定单元里可能含有随帧变化的字段（如 AT+RECV 的长度位 64/69），
+    # 用完整单元会把「同类但该字段不同」的真失配帧漏定位；有界引导前缀只用于
+    # 在缓冲中找到该协议数据帧的起点，再按匹配帧配置「总长度」做收齐判定。
+    _MISMATCH_PREFIX_MAXLEN = 8
+
     def __init__(self):
         super().__init__()
         self.serial_port = None
@@ -428,16 +436,23 @@ class UartAssistantWindow(QMainWindow):
         self.batch_count = 0
         self.batch_total = 0
         self.auto_reply_enabled = False
+        # 失配统计口径：True=精确判定（找到规则帧头且收满匹配帧总长仍未命中才计失配，
+        # 排除 OK/+RECV:ERROR 等无关回应与分片截断）；False=宽松判定（缓冲超时未命中即计）。
+        # 仅影响「应答失配」计数，不影响应答命中（命中始终全量滑动匹配）。默认 True。
+        self.auto_reply_head_match = True
         self.reply_rules = []
         # 自动应答规则命中次数计数器：{规则标识: 已命中次数}
         # 作为应答帧「递增值」单元的 iteration（首次命中为 0，即取起始值），仅运行时有效不持久化。
         # 由 _precompile_rules() 在规则集合变动时裁剪失效 key，避免长期运行内存增长。
         self._reply_increment_counters = {}
-        # 已启用规则的「帧头前缀」字节集合：每条规则首个 fixed 单元的完整字节串。
-        # 仅用于失配统计口径——缓冲超时丢弃时，含某规则帧头却未命中才算「真正失配」，
-        # 不含任何规则帧头的无关数据（如模组回应的 OK/ERROR）静默丢弃，不计失配。
+        # 已启用规则的「失配判定规格」列表：每项 dict(head=帧引导前缀或 None, total_len=匹配帧总长度)。
+        # head 取每条规则首个 fixed 单元前 _MISMATCH_PREFIX_MAXLEN 字节（避开尾部随帧变化的字段），
+        # 仅用于在缓冲中定位该协议数据帧的起点；首单元非 fixed 时 head=None（只能从缓冲起点算）。
+        # total_len 为匹配帧各单元长度之和（与 match_frame 的最小匹配长度同口径）。
+        # 缓冲超时丢弃时，从定位到的帧头起收满 total_len 字节却仍未命中，才计「真正失配」；
+        # 未收满 total_len 视为不完整帧，不含任何帧头的无关数据（如模组回应 OK/+RECV:ERROR）静默丢弃，均不计失配。
         # 由 _precompile_rules() 在规则变动后重建。
-        self._rules_match_prefixes = []
+        self._rules_mismatch_specs = []
         self.quick_commands = []
         self.send_history = []
         self.start_time = None
@@ -983,6 +998,16 @@ class UartAssistantWindow(QMainWindow):
         self._reg(self.auto_reply_check.setText, "启用自动应答")
         self.auto_reply_check.toggled.connect(self.on_auto_reply_toggled)
         enable_layout.addWidget(self.auto_reply_check)
+        # 失配统计口径开关：勾选=按帧头+匹配帧总长精确判定（默认）；不勾选=超时未命中即计。
+        # 只影响「应答失配」计数，不影响应答命中行为。
+        self.head_match_check = QCheckBox()
+        self._reg(self.head_match_check.setText, "失配按帧头判定")
+        self.head_match_check.setChecked(True)
+        self.head_match_check.setToolTip(self._tr(
+            "勾选：仅当收到规则帧头且收满配置总长却未命中时才计失配（排除 OK/ERROR 等回应与不完整帧）\n"
+            "不勾选：接收缓冲超时未命中即计失配（适合无固定帧头的协议或宽松排查）"))
+        self.head_match_check.toggled.connect(self.on_head_match_toggled)
+        enable_layout.addWidget(self.head_match_check)
         enable_layout.addStretch()
         reply_layout.addLayout(enable_layout)
         
@@ -1897,21 +1922,51 @@ class UartAssistantWindow(QMainWindow):
             text += f"\n    ... 共 {total} 字节，仅转储前 {len(show)} 字节"
         return text
 
+    def _is_real_mismatch_buffer(self, buf_bytes):
+        """判定一份「最终未命中任何规则」的超时缓冲是否为真正失配。
+
+        依据失配统计口径开关 self.auto_reply_head_match：
+        - 精确判定（True，默认）：对每条已启用规则，先用其有界帧引导前缀 head 在缓冲中
+          定位该协议数据帧的起点（head=None 表示首单元非固定值，只能从缓冲起点算）；
+          从帧头起可用字节数 >= 该规则匹配帧总长度 total_len，说明一整帧已收齐却仍未
+          命中 → 真失配；帧头后不足 total_len 视为不完整帧，找不到任何帧头视为无关数据，
+          均不计失配（如模组回应 OK/+RECV:ERROR、分片截断）。
+        - 宽松判定（False）：不做帧头/长度过滤，只要有启用规则且缓冲非空、超时未命中即计
+          失配。适合无固定帧头的协议或需要统计任何异常回应的排查场景（此时 OK/ERROR 等
+          无关回应也会被计入，属预期行为）。
+        """
+        if not hasattr(self, '_rules_mismatch_specs'):
+            self._precompile_rules()
+        # 宽松模式：只要存在启用规则（规格非空），超时未命中即计失配
+        if not getattr(self, 'auto_reply_head_match', True):
+            return bool(self._rules_mismatch_specs)
+        n = len(buf_bytes)
+        for spec in self._rules_mismatch_specs:
+            head = spec.get('head')
+            total_len = spec.get('total_len', 0)
+            if total_len <= 0:
+                continue
+            if head:
+                idx = buf_bytes.find(head)
+                if idx < 0:
+                    continue  # 缓冲中没有该协议帧头
+            else:
+                idx = 0  # 帧头未知，只能从缓冲起点估算
+            # 从帧头起到缓冲末尾的可用字节数
+            if n - idx >= total_len:
+                return True
+            # 不足总长：可能是不完整帧，继续看其它规则（不据此计失配）
+        return False
+
     def flush_auto_reply_buffer(self):
         """刷新自动应答缓冲区，超时后清空缓冲区。
 
-        失配统计口径（仅统计「目标数据帧」是否失配）：
-        - 缓冲中含任一已启用规则的帧头前缀、却最终未命中 → 判定为真正失配，计数并 hex 转储；
-        - 不含任何规则帧头的无关数据（如模组对 AT 指令回应的 OK/ERROR）→ 静默清空，不计失配；
-        - 存在「首单元非固定值」的规则（无法预提取帧头）时，无法排除相关性，保守计为失配，避免漏报。
+        失配统计口径见 _is_real_mismatch_buffer()：仅当某规则的目标数据帧已按配置
+        总长度收齐、却仍未命中时才计失配；不完整帧与完全无关数据静默清空、不计失配。
         """
         if len(self.auto_reply_buffer) > 0:
             buf_bytes = bytes(self.auto_reply_buffer)
-            if not hasattr(self, '_rules_match_prefixes'):
-                self._precompile_rules()
-            # 帧头未知的规则存在时无法判定，保守按失配处理
-            is_real_mismatch = bool(self._rules_no_prefix) or any(
-                p and p in buf_bytes for p in self._rules_match_prefixes)
+            is_real_mismatch = self._is_real_mismatch_buffer(buf_bytes)
             if is_real_mismatch:
                 self.auto_reply_timeout_count += 1
                 print(f"[DEBUG] 自动应答缓冲区超时，清空缓冲区，长度: {len(buf_bytes)}，"
@@ -1919,7 +1974,7 @@ class UartAssistantWindow(QMainWindow):
                 print("[DEBUG] 失配缓冲转储(HEX/ASCII):\n"
                       + self._format_hex_dump(buf_bytes))
             else:
-                print(f"[DEBUG] 自动应答缓冲区超时，丢弃无关数据（不计失配），长度: {len(buf_bytes)}")
+                print(f"[DEBUG] 自动应答缓冲区超时，丢弃不完整/无关数据（不计失配），长度: {len(buf_bytes)}")
             self.auto_reply_buffer.clear()
     
     def send_data(self, data=None, show_errors=True, _skip_stats=False):
@@ -3117,6 +3172,11 @@ class UartAssistantWindow(QMainWindow):
     def on_auto_reply_toggled(self, enabled):
         print(f"[DEBUG] 自动应答状态: {enabled}")
         self.auto_reply_enabled = enabled
+
+    def on_head_match_toggled(self, enabled):
+        print(f"[DEBUG] 失配按帧头判定: {enabled}")
+        self.auto_reply_head_match = enabled
+        self.save_config()
     
     def load_rules(self):
         print("[DEBUG] 加载自动应答规则")
@@ -3452,6 +3512,29 @@ class UartAssistantWindow(QMainWindow):
                 return False, {}, pos
         return True, captures, pos
 
+    def _match_frame_min_len(self, match_frame):
+        """计算匹配帧所需的总长度（各单元权威长度之和；校验单元按算法实际字节数）。
+        match_frame 的匹配与失配「收齐」判定共用此口径。无法构成帧时返回 0。"""
+        min_len = 0
+        for unit in match_frame:
+            if unit.get('type') == 'checksum':
+                # 校验单元长度由算法决定，而非 length 字段
+                algo = unit.get('algorithm', 'xor8')
+                if algo == 'xor':
+                    algo = 'xor8'
+                elif algo == 'sum':
+                    algo = 'sum8'
+                spec = self.CHECKSUM_ALGORITHMS.get(algo)
+                if spec and spec[0] == 'crc':
+                    min_len += spec[1] // 8
+                elif algo in ('sum16', 'sum16_inet'):
+                    min_len += 2
+                else:
+                    min_len += 1
+            else:
+                min_len += unit.get('length', 1)
+        return min_len
+
     def match_frame(self, data, match_frame, fmt='HEX'):
         """匹配接收数据是否符合匹配帧配置（支持滑动帧头搜索）。
         返回 (是否匹配, 捕获字典)。捕获字典以单元名称为键，保存通配符匹配到的字节。
@@ -3469,24 +3552,7 @@ class UartAssistantWindow(QMainWindow):
                 return False, {}
 
             # 计算匹配帧所需最小长度，减少无谓的滑动尝试
-            min_len = 0
-            for unit in match_frame:
-                if unit.get('type') == 'checksum':
-                    # 校验单元长度由算法决定，而非 length 字段
-                    algo = unit.get('algorithm', 'xor8')
-                    if algo == 'xor':
-                        algo = 'xor8'
-                    elif algo == 'sum':
-                        algo = 'sum8'
-                    spec = self.CHECKSUM_ALGORITHMS.get(algo)
-                    if spec and spec[0] == 'crc':
-                        min_len += spec[1] // 8
-                    elif algo in ('sum16', 'sum16_inet'):
-                        min_len += 2
-                    else:
-                        min_len += 1
-                else:
-                    min_len += unit.get('length', 1)
+            min_len = self._match_frame_min_len(match_frame)
             if min_len == 0 or len(data) < min_len:
                 return False, {}
 
@@ -3605,15 +3671,18 @@ class UartAssistantWindow(QMainWindow):
         必须在 reply_rules 变动后调用。"""
         self._rules_first_byte_index = {}
         self._rules_no_prefix = []
-        self._rules_match_prefixes = []
+        self._rules_mismatch_specs = []
         for rule in self.reply_rules:
             if not rule.get('enabled', True):
                 continue
             mf = rule.get('match_frame', [])
             if not mf:
                 continue
+            # 失配判定规格：匹配帧总长度 + 帧引导前缀（首 fixed 单元有界头部，可能为 None）
+            total_len = self._match_frame_min_len(mf)
             first = mf[0]
             first_byte = None
+            head = None
             if first.get('type') == 'fixed':
                 fmt = rule.get('format', 'HEX')
                 try:
@@ -3621,10 +3690,14 @@ class UartAssistantWindow(QMainWindow):
                     flen = first.get('length', 1)
                     if raw and flen > 0 and len(raw) >= 1:
                         first_byte = raw[0]
-                        # 完整帧头前缀用于失配判定（首字节过滤粒度过粗）
-                        self._rules_match_prefixes.append(bytes(raw))
+                        # 有界帧引导前缀仅用于在缓冲中定位帧头：只取前
+                        # _MISMATCH_PREFIX_MAXLEN 字节，避开首 fixed 单元尾部随帧变化的
+                        # 字段（如 AT 帧长度位 64/69），否则同类真失配帧无法被定位。
+                        head = bytes(raw)[:self._MISMATCH_PREFIX_MAXLEN]
                 except Exception:
                     first_byte = None
+            if total_len > 0:
+                self._rules_mismatch_specs.append({'head': head, 'total_len': total_len})
             if first_byte is None:
                 self._rules_no_prefix.append(rule)
             else:
@@ -3968,6 +4041,20 @@ class UartAssistantWindow(QMainWindow):
                     self.buffer_timeout = bt
             except Exception:
                 pass
+
+            # 加载失配统计口径：默认精确判定（按帧头+总长），仅在复选框已创建后同步 UI
+            try:
+                self.auto_reply_head_match = settings.value(
+                    "auto_reply_head_match", True, type=bool)
+            except Exception:
+                self.auto_reply_head_match = True
+            if hasattr(self, 'head_match_check'):
+                # 屏蔽信号再 setChecked：加载时不触发 toggled（避免初始化阶段误存配置）
+                self.head_match_check.blockSignals(True)
+                try:
+                    self.head_match_check.setChecked(self.auto_reply_head_match)
+                finally:
+                    self.head_match_check.blockSignals(False)
             
             # 更新当前日志状态标签
             if hasattr(self, 'current_log_label'):
@@ -3999,6 +4086,9 @@ class UartAssistantWindow(QMainWindow):
                 settings.setValue("buffer_timeout", int(getattr(self, 'buffer_timeout', 33)))
             except Exception:
                 pass
+
+            # 保存失配统计口径（默认 True=按帧头+总长精确判定）
+            settings.setValue("auto_reply_head_match", bool(self.auto_reply_head_match))
             
             print(f"[DEBUG] 日志配置已保存")
         except Exception as e:
