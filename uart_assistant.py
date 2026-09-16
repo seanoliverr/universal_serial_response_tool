@@ -81,7 +81,7 @@ EN_TRANSLATIONS = {
     "清空": "Clear",
     # 自动应答
     "启用自动应答": "Enable Auto Reply",
-    "失配按帧头判定": "Strict Mismatch by Frame Head",
+    "失配统计按帧头判定": "Mismatch Count by Frame Head",
     "配置规则": "Configure Rules",
     "规则列表": "Rule List",
     "添加规则": "Add Rule",
@@ -1001,7 +1001,7 @@ class UartAssistantWindow(QMainWindow):
         # 失配统计口径开关：勾选=按帧头+匹配帧总长精确判定（默认）；不勾选=超时未命中即计。
         # 只影响「应答失配」计数，不影响应答命中行为。
         self.head_match_check = QCheckBox()
-        self._reg(self.head_match_check.setText, "失配按帧头判定")
+        self._reg(self.head_match_check.setText, "失配统计按帧头判定")
         self.head_match_check.setChecked(True)
         self.head_match_check.setToolTip(self._tr(
             "勾选：仅当收到规则帧头且收满配置总长却未命中时才计失配（排除 OK/ERROR 等回应与不完整帧）\n"
@@ -3174,7 +3174,7 @@ class UartAssistantWindow(QMainWindow):
         self.auto_reply_enabled = enabled
 
     def on_head_match_toggled(self, enabled):
-        print(f"[DEBUG] 失配按帧头判定: {enabled}")
+        print(f"[DEBUG] 失配统计按帧头判定: {enabled}")
         self.auto_reply_head_match = enabled
         self.save_config()
     

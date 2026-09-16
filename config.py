@@ -5,7 +5,7 @@ import os
 
 # 应用配置
 APP_NAME = "串口应答调试助手"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.10"
 
 # 配置文件路径
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".uart_tool")
